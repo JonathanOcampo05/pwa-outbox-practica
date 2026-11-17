@@ -1,4 +1,4 @@
-// app.js - Interfaz, envio resiliente (Outbox) y sincronizacion al volver la red.
+// app.js - Interfaz, envio resiliente (Outbox) y respaldo de sincronizacion.
 // Sin async/await: solo new Promise, .then(), .catch() y Promise.all().
 
 const ENDPOINT = 'https://jsonplaceholder.typicode.com/posts';
@@ -7,6 +7,25 @@ const formulario = document.getElementById('form-incidencia');
 const listaOutbox = document.getElementById('lista-outbox');
 const btnPurgar = document.getElementById('btn-purgar');
 const badgeRed = document.getElementById('badge-red');
+
+// ---------- Deteccion real de Background Sync ----------
+// Algunos navegadores (ej. Brave) exponen SyncManager pero niegan el permiso,
+// y sync.register() falla con NotAllowedError. Por eso no basta con
+// 'SyncManager' in window: tambien se consulta el permiso 'background-sync'.
+let backgroundSyncDisponible = 'serviceWorker' in navigator && 'SyncManager' in window;
+
+function verificarBackgroundSync() {
+  if (!backgroundSyncDisponible || !navigator.permissions) {
+    return Promise.resolve(backgroundSyncDisponible);
+  }
+  return navigator.permissions
+    .query({ name: 'background-sync' })
+    .then((estado) => {
+      backgroundSyncDisponible = estado.state === 'granted';
+      return backgroundSyncDisponible;
+    })
+    .catch(() => backgroundSyncDisponible); // permiso no consultable: confiar en SyncManager
+}
 
 // ---------- Indicador de red ----------
 function actualizarIndicadorRed() {
@@ -82,20 +101,36 @@ function procesarEnvioReporte(datosFormulario) {
       });
     })
     .catch(() => {
-      console.warn('[Outbox] Sin conexión. Encolando transacción localmente...');
-      // Falla de red: guardar en IndexedDB como pendiente para reenvio posterior
+      console.warn('[Outbox] Sin conexión. Encolando en IndexedDB...');
+
       return guardarRegistro({
         ...datosFormulario,
         estado: 'pendiente',
         fechaCreacion: Date.now()
+      }).then(() => {
+        // Tema 5.3: delegar el reenvio al Service Worker si hay Background Sync
+        if (backgroundSyncDisponible) {
+          return navigator.serviceWorker.ready
+            .then((registro) => {
+              console.log('[Outbox] Registrando etiqueta sync-reportes en el SW...');
+              return registro.sync.register('sync-reportes');
+            })
+            .catch((error) => {
+              // Degradacion elegante: si el navegador rechaza el registro,
+              // el reporte ya esta en IndexedDB y lo enviara el fallback 'online'.
+              console.warn('[Outbox] Background Sync no disponible, se usará el fallback:', error.name);
+              backgroundSyncDisponible = false;
+            });
+        }
       });
     })
     .then(() => renderizarColaOutbox());
 }
 
-// ---------- UPDATE: barrido y reenvio de pendientes ----------
-function sincronizarPendientes() {
-  console.log('[Outbox] Conexión detectada. Buscando registros pendientes...');
+// ---------- UPDATE (respaldo): barrido de pendientes desde la UI ----------
+// Solo se usa en navegadores sin SyncManager (Safari/iOS, Firefox).
+function sincronizarPendientesFallback() {
+  console.log('[Outbox] Buscando registros pendientes (fallback)...');
 
   return obtenerTodosLosRegistros()
     .then((registros) => {
@@ -106,7 +141,6 @@ function sincronizarPendientes() {
         return;
       }
 
-      // Convertir cada registro pendiente en una promesa de envio + actualizacion
       const promesasDeEnvio = pendientes.map((item) => {
         return fetch(ENDPOINT, {
           method: 'POST',
@@ -118,7 +152,6 @@ function sincronizarPendientes() {
         });
       });
 
-      // Esperar a que todos los reenvios concluyan
       return Promise.all(promesasDeEnvio);
     })
     .then(() => renderizarColaOutbox())
@@ -130,13 +163,27 @@ function sincronizarPendientes() {
 // ---------- Eventos de red ----------
 window.addEventListener('online', () => {
   actualizarIndicadorRed();
-  sincronizarPendientes();
+
+  // Degradacion elegante: solo sincronizar desde la UI si NO hay Background Sync
+  // utilizable (Safari/iOS, Firefox, Brave). Con Background Sync el SW se encarga;
+  // hacerlo tambien aqui duplicaria los POST.
+  if (!backgroundSyncDisponible) {
+    console.log('[Outbox] Sin Background Sync utilizable. Fallback por evento online...');
+    sincronizarPendientesFallback();
+  }
 });
 
 window.addEventListener('offline', actualizarIndicadorRed);
 
-// ---------- Registro del Service Worker (ruta relativa) ----------
+// ---------- Mensajes del Service Worker (postMessage) ----------
 if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', (event) => {
+    if (event.data && event.data.tipo === 'OUTBOX_SINCRONIZADO') {
+      console.log('[UI] Confirmación recibida del Service Worker. Actualizando bandeja...');
+      renderizarColaOutbox();
+    }
+  });
+
   window.addEventListener('load', () => {
     navigator.serviceWorker
       .register('./sw.js')
@@ -171,11 +218,12 @@ btnPurgar.addEventListener('click', () => {
 
 // ---------- Arranque ----------
 actualizarIndicadorRed();
-renderizarColaOutbox()
+Promise.all([renderizarColaOutbox(), verificarBackgroundSync()])
   .then(() => {
-    // Si la pagina abre con red y quedaron pendientes, reenviarlos
-    if (navigator.onLine) {
-      return sincronizarPendientes();
+    console.log('[Outbox] Background Sync disponible:', backgroundSyncDisponible);
+    // Si la pagina abre con red y hay pendientes, y no hay Background Sync, reenviar
+    if (navigator.onLine && !backgroundSyncDisponible) {
+      return sincronizarPendientesFallback();
     }
   })
   .catch((error) => console.error('[Outbox] Error al iniciar:', error));
